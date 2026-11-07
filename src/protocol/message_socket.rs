@@ -1,0 +1,118 @@
+use std::{
+    io::{BufReader, BufWriter, Read, Write},
+    marker::PhantomData,
+    net::TcpStream,
+    sync::mpsc::{self, TryRecvError},
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+
+use bitcode::{DecodeOwned, Encode};
+use eyre::{Context, bail};
+use tracing::info;
+
+/// Upper bound on a single framed message, to stop a corrupt or hostile length
+/// prefix from turning into a multi-gigabyte allocation. The largest legitimate
+/// message is a world update (~82 KB, see PIXEL_RUN_MAX in world_sync/world.lua)
+/// plus entity-sync batches, so this leaves a very wide margin.
+pub const MAX_MESSAGE_LEN: u32 = 64 * 1024 * 1024;
+
+fn read_one<T: DecodeOwned>(mut buf: impl Read) -> eyre::Result<T> {
+    let mut len_buf = [0u8; 4];
+    buf.read_exact(&mut len_buf)
+        .wrap_err("Couldn't receive the length from stream")?;
+    let len = u32::from_le_bytes(len_buf);
+    if len > MAX_MESSAGE_LEN {
+        bail!("Message length {len} exceeds the maximum of {MAX_MESSAGE_LEN}");
+    }
+    let mut out_buf = vec![0; usize::try_from(len)?];
+    buf.read_exact(out_buf.as_mut_slice())
+        .wrap_err("Couldn't read message body")?;
+    bitcode::decode(&out_buf).wrap_err("Failed to decode message body")
+}
+
+pub struct MessageSocket<Inbound, Outbound> {
+    socket: BufWriter<TcpStream>,
+    recv_messages: mpsc::Receiver<eyre::Result<Inbound>>,
+    reader_thread: Option<JoinHandle<()>>,
+    _phantom: PhantomData<fn() -> Outbound>,
+}
+
+impl<Inbound: DecodeOwned + Send + 'static, Outbound: Encode> MessageSocket<Inbound, Outbound> {
+    pub fn new(socket: TcpStream) -> eyre::Result<Self> {
+        socket.set_write_timeout(Some(Duration::from_secs(10)))?;
+        // The proxy sets this on its accepted sockets, but the ewext side (which
+        // connects) never did - leaving Nagle enabled on the game -> proxy
+        // direction, which is the one on the frame-critical path.
+        socket.set_nodelay(true)?;
+        let (sender, recv_messages) = mpsc::channel();
+        let reader_thread = Some(thread::spawn({
+            let socket = socket.try_clone()?;
+            move || {
+                let mut socket = BufReader::new(socket);
+                loop {
+                    let res = read_one(&mut socket);
+                    let res_was_error = res.is_err();
+                    if sender.send(res).is_err() {
+                        break;
+                    }
+                    if res_was_error {
+                        break;
+                    }
+                }
+            }
+        }));
+
+        Ok(Self {
+            // A single world-sync chunk can reach ~82 KB; with the default 8 KB
+            // BufWriter capacity every such message went straight to the kernel
+            // and could block the game thread. Size the buffer past that.
+            socket: BufWriter::with_capacity(256 * 1024, socket),
+            recv_messages,
+            reader_thread,
+            _phantom: PhantomData,
+        })
+    }
+
+    pub fn try_read(&mut self) -> eyre::Result<Option<Inbound>> {
+        match self.recv_messages.try_recv() {
+            Ok(msg) => Some(msg).transpose(),
+            Err(TryRecvError::Disconnected) => {
+                bail!("Channel disconnected");
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+        }
+    }
+
+    // Surely doing a blocking write won't be a problem over a loopback interface.
+    pub fn write(&mut self, value: &Outbound) -> eyre::Result<()> {
+        let encoded = bitcode::encode(value);
+        self.socket
+            .write_all(&u32::to_le_bytes(
+                u32::try_from(encoded.len()).wrap_err("Message too large to be sent")?,
+            ))
+            .wrap_err("Couldn't write length to stream")?;
+        self.socket
+            .write_all(&encoded)
+            .wrap_err("Couldn't write message body to stream")?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> eyre::Result<()> {
+        self.socket.flush()?;
+        Ok(())
+    }
+}
+
+impl<Inbound, Outbound> Drop for MessageSocket<Inbound, Outbound> {
+    fn drop(&mut self) {
+        self.socket
+            .get_mut()
+            .shutdown(std::net::Shutdown::Both)
+            .ok();
+        if let Some(handle) = self.reader_thread.take() {
+            handle.join().ok();
+        }
+        info!("Message socket dropped");
+    }
+}

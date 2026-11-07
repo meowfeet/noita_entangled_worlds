@@ -1,6 +1,0 @@
-data/scripts/biome_scripts.lua
-data/biome_impl/static_tile/watchtower.lua
-data/biome_impl/static_tile/temples_common.lua
-#data/scripts/biomes/moon_room.lua
-#data/scripts/biomes/watercave.lua
-#data/scripts/biomes/tower_end.lua

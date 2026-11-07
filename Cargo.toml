@@ -1,0 +1,29 @@
+[package]
+name = "noita_proxy"
+description = "Noita Entangled Worlds proxy application."
+version = "1.6.8"
+edition = "2024"
+
+[dependencies]
+bitcode = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
+ctrlc = "3"
+dashmap = "6"
+eyre = "0.6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
+rand = "0.10"
+rayon = "1"
+rstar = "0.14"
+rustc-hash = "2"
+steamworks = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+wide = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = true
+strip = true
