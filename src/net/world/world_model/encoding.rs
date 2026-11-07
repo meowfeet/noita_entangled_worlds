@@ -1,55 +1,49 @@
 use bitcode::{Decode, Encode};
-use bytemuck::{AnyBitPattern, NoUninit, bytes_of, pod_read_unaligned};
-use std::mem::size_of;
 
-#[derive(Debug, Clone, Copy, AnyBitPattern, NoUninit, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct Header {
+/// Position and size of a world update. w/h are actually width/height - 1.
+#[derive(Debug, Clone, Copy)]
+pub struct Header {
     pub x: i32,
     pub y: i32,
     pub w: u8,
     pub h: u8,
-    pub run_count: u16,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Pixels in the format the mod sends and expects: a header followed by pixel runs.
+#[derive(Debug)]
 pub struct NoitaWorldUpdate {
-    pub(crate) header: Header,
-    pub(crate) runs: Vec<PixelRun<RawPixel>>,
+    pub header: Header,
+    pub runs: Vec<PixelRun<RawPixel>>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct RawPixel {
+pub struct RawPixel {
     pub material: u16,
     pub flags: u8,
-}
-
-struct ByteParser<'a> {
-    data: &'a [u8],
 }
 
 /// Stores a run of pixels.
 /// Not specific to Noita side - length is an actual length
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
-pub struct PixelRun<Pixel> {
+pub struct PixelRun<T> {
     pub length: u32,
-    pub data: Pixel,
+    pub data: T,
 }
 
 /// Converts a normal sequence of pixels to a run-length-encoded one.
-pub struct PixelRunner<Pixel> {
-    current_pixel: Option<Pixel>,
+pub struct PixelRunner<T> {
+    current_pixel: Option<T>,
     current_run_len: u32,
-    runs: Vec<PixelRun<Pixel>>,
+    runs: Vec<PixelRun<T>>,
 }
 
-impl<Pixel: Eq + Copy> Default for PixelRunner<Pixel> {
+impl<T: Eq + Copy> Default for PixelRunner<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<Pixel: Eq + Copy> PixelRunner<Pixel> {
+impl<T: Eq + Copy> PixelRunner<T> {
     pub fn new() -> Self {
         Self {
             current_pixel: None,
@@ -57,7 +51,7 @@ impl<Pixel: Eq + Copy> PixelRunner<Pixel> {
             runs: Vec::new(),
         }
     }
-    pub fn put_pixel(&mut self, pixel: Pixel) {
+    pub fn put_pixel(&mut self, pixel: T) {
         if let Some(current) = self.current_pixel {
             if pixel != current {
                 self.runs.push(PixelRun {
@@ -74,7 +68,7 @@ impl<Pixel: Eq + Copy> PixelRunner<Pixel> {
             self.current_run_len = 1;
         }
     }
-    pub fn build(mut self) -> Vec<PixelRun<Pixel>> {
+    pub fn build(mut self) -> Vec<PixelRun<T>> {
         if self.current_run_len > 0 {
             self.runs.push(PixelRun {
                 length: self.current_run_len,
@@ -88,73 +82,74 @@ impl<Pixel: Eq + Copy> PixelRunner<Pixel> {
 impl PixelRunner<RawPixel> {
     /// Note: w/h are actualy width/height -1
     pub fn into_noita_update(self, x: i32, y: i32, w: u8, h: u8) -> NoitaWorldUpdate {
-        let runs = self.build();
         NoitaWorldUpdate {
-            header: Header {
-                x,
-                y,
-                w,
-                h,
-                run_count: runs.len() as u16,
-            },
-            runs,
+            header: Header { x, y, w, h },
+            runs: self.build(),
         }
     }
 }
 
-impl<'a> ByteParser<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data }
-    }
+/// Reads little-endian values off the front of a byte slice.
+struct ByteParser<'a> {
+    data: &'a [u8],
+}
 
-    fn next<T: AnyBitPattern>(&mut self) -> T {
-        let size = size_of::<T>();
-        let sli = &self.data[..size];
-        self.data = &self.data[size..];
-        pod_read_unaligned(sli)
+impl ByteParser<'_> {
+    fn bytes<const N: usize>(&mut self) -> [u8; N] {
+        let (bytes, rest) = self
+            .data
+            .split_first_chunk()
+            .expect("world update is complete");
+        self.data = rest;
+        *bytes
     }
-
-    fn next_run(&mut self) -> PixelRun<RawPixel> {
-        PixelRun {
-            length: u32::from(self.next::<u16>()) + 1,
-            data: RawPixel {
-                material: self.next(),
-                flags: self.next(),
-            },
-        }
+    fn u8(&mut self) -> u8 {
+        self.bytes::<1>()[0]
+    }
+    fn u16(&mut self) -> u16 {
+        u16::from_le_bytes(self.bytes())
+    }
+    fn i32(&mut self) -> i32 {
+        i32::from_le_bytes(self.bytes())
     }
 }
 
 impl NoitaWorldUpdate {
     pub fn load(data: &[u8]) -> Self {
-        let mut parser = ByteParser::new(data);
-
-        let header: Header = parser.next();
-        let mut runs = Vec::with_capacity(header.run_count.into());
-
-        for _ in 0..header.run_count {
-            runs.push(parser.next_run());
-        }
-
+        let mut parser = ByteParser { data };
+        let header = Header {
+            x: parser.i32(),
+            y: parser.i32(),
+            w: parser.u8(),
+            h: parser.u8(),
+        };
+        let run_count = parser.u16();
+        let runs = (0..run_count)
+            .map(|_| PixelRun {
+                length: u32::from(parser.u16()) + 1,
+                data: RawPixel {
+                    material: parser.u16(),
+                    flags: parser.u8(),
+                },
+            })
+            .collect();
         assert!(parser.data.is_empty());
-
         Self { header, runs }
     }
+
     pub fn save(&self) -> Vec<u8> {
-        let header = Header {
-            run_count: self.runs.len() as u16,
-            ..self.header
-        };
-        let mut buf = Vec::new();
-        buf.extend_from_slice(bytes_of(&header));
-
+        let header = self.header;
+        let mut buf = Vec::with_capacity(12 + self.runs.len() * 5);
+        buf.extend(header.x.to_le_bytes());
+        buf.extend(header.y.to_le_bytes());
+        buf.push(header.w);
+        buf.push(header.h);
+        buf.extend((self.runs.len() as u16).to_le_bytes());
         for run in &self.runs {
-            let len = u16::try_from(run.length - 1).unwrap();
-            buf.extend_from_slice(bytes_of(&len));
-            buf.extend_from_slice(bytes_of(&run.data.material));
-            buf.extend_from_slice(bytes_of(&run.data.flags));
+            buf.extend(u16::try_from(run.length - 1).unwrap().to_le_bytes());
+            buf.extend(run.data.material.to_le_bytes());
+            buf.push(run.data.flags);
         }
-
         buf
     }
 }

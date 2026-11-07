@@ -2,7 +2,7 @@ use crate::game_settings::GameMode;
 use std::io::Write;
 
 /// Trait that allows to pass value to mod as proxy options.
-pub(crate) trait ProxyOpt {
+pub trait ProxyOpt {
     fn write_opt(self, buf: &mut Vec<u8>, key: &str);
 }
 

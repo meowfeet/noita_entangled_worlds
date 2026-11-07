@@ -3,17 +3,12 @@
 use std::{env, path::PathBuf};
 
 use crate::game_settings::{GameMode, GameSettings, LocalHealthMode};
-use crate::player_cosmetics::PlayerColor;
 
 /// Your name in game. `None` uses your Steam name.
 pub const NICKNAME: Option<&str> = None;
 
 /// Path to noita.exe. `None` finds it through Steam.
 pub const NOITA_EXE: Option<&str> = None;
-
-/// Use Steam networking even if you don't own Noita on Steam (e.g. the GOG version).
-/// Everyone in the lobby needs the same value.
-pub const SPACEWARS: bool = false;
 
 /// Steam lobby type when hosting: public, else friends only, else private (lobby code only).
 pub const PUBLIC_LOBBY: bool = false;
@@ -24,21 +19,6 @@ pub fn save_state_path() -> PathBuf {
     PathBuf::from(env::var_os("APPDATA").expect("APPDATA is set"))
         .join(r"quant\entangledworlds\data\save_state")
 }
-
-/// Player colors (RGB).
-pub const PLAYER_COLOR: PlayerColor = PlayerColor {
-    player_main: [155, 111, 154],
-    player_alt: [127, 84, 118],
-    player_arm: [89, 67, 84],
-    player_cape: [118, 84, 127],
-    player_cape_edge: [154, 111, 155],
-    player_forearm: [158, 115, 154],
-};
-pub const INVERT_BORDER: bool = false;
-/// Cosmetics, only shown if you have unlocked them.
-pub const CROWN: bool = true;
-pub const AMULET: bool = true;
-pub const AMULET_GEM: bool = true;
 
 /// Game settings. Only used when you host, everyone else gets the host's.
 pub fn game_settings() -> GameSettings {

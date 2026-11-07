@@ -1,4 +1,3 @@
-use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use bitcode::{Decode, Encode};
@@ -7,21 +6,20 @@ use encoding::{NoitaWorldUpdate, PixelRun, PixelRunner};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{info, warn};
 
+pub mod chunk;
+pub mod encoding;
+
+pub const CHUNK_SIZE: usize = 128;
 /// Number of pixels in a chunk. Run lengths decoded from the network are
 /// clamped against this: `Chunk` stores a fixed `[u16; CHUNK_AREA]`, so a run
 /// set that sums past it would index out of bounds and panic the net thread.
-const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
-
-pub(crate) mod chunk;
-pub mod encoding;
-
-pub(crate) const CHUNK_SIZE: usize = 128;
+pub const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
 
 #[derive(Debug, Encode, Decode, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct ChunkCoord(pub i32, pub i32);
 
 #[derive(Default)]
-pub(crate) struct WorldModel {
+pub struct WorldModel {
     chunks: FxHashMap<ChunkCoord, Chunk>,
     /// Tracks chunks which we written to.
     /// This includes any write, not just those that actually changed at least one pixel.
@@ -36,20 +34,20 @@ pub(crate) struct WorldModel {
 /// Contains full info abount a chunk, RLE encoded.
 /// Kinda close to ChunkDelta, but doesn't assume we know anything about the chunk.
 #[derive(Debug, Encode, Decode, Clone)]
-pub(crate) struct ChunkData {
+pub struct ChunkData {
     pub runs: Vec<PixelRun<CompactPixel>>,
 }
 
 /// Contains a diff, only pixels that were updated, for a given chunk.
 #[derive(Debug, Encode, Decode, Clone)]
-pub(crate) struct ChunkDelta {
+pub struct ChunkDelta {
     pub chunk_coord: ChunkCoord,
     runs: Arc<Vec<PixelRun<Option<CompactPixel>>>>,
 }
 
 impl ChunkData {
-    pub(crate) fn apply_to_chunk(&self, chunk: &mut Chunk) {
-        let nil = CompactPixel(NonZeroU16::new(4095).unwrap());
+    pub fn apply_to_chunk(&self, chunk: &mut Chunk) {
+        let nil = CompactPixel::default();
         let mut offset = 0;
         for run in &self.runs {
             let len = (run.length as usize).min(CHUNK_AREA - offset);
@@ -70,8 +68,8 @@ impl ChunkData {
             }
         }
     }
-    pub(crate) fn apply_delta(&mut self, delta: ChunkData) {
-        let nil = CompactPixel(NonZeroU16::new(4095).unwrap());
+    pub fn apply_delta(&mut self, delta: ChunkData) {
+        let nil = CompactPixel::default();
         let mut chunk = Chunk::default();
         self.apply_to_chunk(&mut chunk);
         let mut offset = 0;
@@ -105,16 +103,6 @@ impl WorldModel {
         let offset = x + y * CHUNK_SIZE;
         (ChunkCoord(chunk_x, chunk_y), offset)
     }
-
-    /*fn set_pixel(&mut self, x: i32, y: i32, pixel: Pixel) {
-        let (chunk_coord, offset) = Self::get_chunk_coords(x, y);
-        let chunk = self.chunks.entry(chunk_coord).or_default();
-        let current = chunk.pixel(offset);
-        if current != pixel {
-            chunk.set_pixel(offset, pixel);
-        }
-        self.updated_chunks.insert(chunk_coord);
-    }*/
 
     pub fn apply_noita_update(
         &mut self,
@@ -203,13 +191,13 @@ impl WorldModel {
             // Offsets are laid out as `x + y * CHUNK_SIZE`, so a linear walk
             // visits pixels in the same order as the old row-major loop.
             Some(chunk) => {
-                for offset in 0..(CHUNK_SIZE * CHUNK_SIZE) {
+                for offset in 0..CHUNK_AREA {
                     runner.put_pixel(chunk.pixel(offset).to_raw())
                 }
             }
             None => {
                 let unknown = Pixel::default().to_raw();
-                for _ in 0..(CHUNK_SIZE * CHUNK_SIZE) {
+                for _ in 0..CHUNK_AREA {
                     runner.put_pixel(unknown)
                 }
             }
@@ -218,10 +206,9 @@ impl WorldModel {
     }
 
     /// Serialize only the pixels marked changed since the last emission, with
-    /// every other pixel encoded as Unknown. Both decoders skip a pixel whose
-    /// material is -1 (the Lua one in `world_sync/world.lua` and the native one
-    /// in `ewext/src/noita/decode.rs`), so this writes the delta and leaves the
-    /// rest of the chunk as the game has it.
+    /// every other pixel encoded as Unknown. The mod skips a pixel whose
+    /// material is -1, so this writes the delta and leaves the rest of the
+    /// chunk as the game has it.
     ///
     /// Returns None when nothing changed, so a delta that turned out to be a
     /// no-op costs the game nothing.
@@ -268,7 +255,7 @@ impl WorldModel {
         updates
     }
 
-    pub(crate) fn apply_chunk_delta(&mut self, delta: &ChunkDelta) {
+    pub fn apply_chunk_delta(&mut self, delta: &ChunkDelta) {
         self.updated_chunks.insert(delta.chunk_coord);
         let chunk = self.chunks.entry(delta.chunk_coord).or_default();
         let mut offset = 0;
@@ -299,14 +286,14 @@ impl WorldModel {
         }
     }
 
-    pub(crate) fn get_chunk_delta(
+    pub fn get_chunk_delta(
         &self,
         chunk_coord: ChunkCoord,
         ignore_changed: bool,
     ) -> Option<ChunkDelta> {
         let chunk = self.chunks.get(&chunk_coord)?;
         let mut runner = PixelRunner::new();
-        for i in 0..CHUNK_SIZE * CHUNK_SIZE {
+        for i in 0..CHUNK_AREA {
             runner.put_pixel((ignore_changed || chunk.changed(i)).then(|| chunk.compact_pixel(i)))
         }
         let runs = runner.build().into();
@@ -337,7 +324,7 @@ impl WorldModel {
         info!("World model reset");
     }
 
-    pub(crate) fn apply_chunk_data(&mut self, chunk: ChunkCoord, chunk_data: &ChunkData) {
+    pub fn apply_chunk_data(&mut self, chunk: ChunkCoord, chunk_data: &ChunkData) {
         self.updated_chunks.insert(chunk);
         // A snapshot, not a diff: the receiver has no reason to trust its own
         // copy of this chunk, so it has to be written to the game whole.
@@ -346,12 +333,12 @@ impl WorldModel {
         chunk_data.apply_to_chunk(chunk);
     }
 
-    pub(crate) fn get_chunk_data(&self, chunk: ChunkCoord) -> Option<ChunkData> {
+    pub fn get_chunk_data(&self, chunk: ChunkCoord) -> Option<ChunkData> {
         let chunk = self.chunks.get(&chunk)?;
         Some(chunk.to_chunk_data())
     }
 
-    pub(crate) fn forget_chunk(&mut self, chunk: ChunkCoord) {
+    pub fn forget_chunk(&mut self, chunk: ChunkCoord) {
         self.chunks.remove(&chunk);
         self.updated_chunks.remove(&chunk);
         self.full_write_chunks.remove(&chunk);

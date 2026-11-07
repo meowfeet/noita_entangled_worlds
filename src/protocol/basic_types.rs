@@ -1,6 +1,7 @@
 use bitcode::{Decode, Encode};
+use std::fmt;
 
-#[derive(Debug, Encode, Decode, Default, Clone, Copy)]
+#[derive(Debug, Encode, Decode, Clone, Copy)]
 pub struct WorldPos {
     pub x: i32,
     pub y: i32,
@@ -12,31 +13,26 @@ impl WorldPos {
     }
 }
 
-#[derive(Debug, Encode, Decode, Hash, PartialEq, Eq, Clone, Copy, Default)]
+/// A player's id, the raw value of their SteamId.
+#[derive(Debug, Encode, Decode, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct PeerId(pub u64);
 
-#[derive(Encode, Decode, Debug, PartialEq, Eq)]
-pub enum Destination<PeerType> {
-    Peers(Vec<PeerType>),
-    Peer(PeerType),
-    Host,
-    Broadcast,
+impl PeerId {
+    pub fn as_hex(&self) -> String {
+        format!("{:016x}", self.0)
+    }
 }
 
-impl<T> Destination<T> {
-    pub fn convert<A>(self) -> Destination<A>
-    where
-        A: From<T>,
-        T: Copy,
-        T: Clone,
-    {
-        match self {
-            Destination::Peer(p) => Destination::Peer(p.into()),
-            Destination::Peers(p) => {
-                Destination::Peers(p.iter().cloned().map(|p| p.into()).collect())
-            }
-            Destination::Host => Destination::Host,
-            Destination::Broadcast => Destination::Broadcast,
-        }
+impl fmt::Display for PeerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
+}
+
+#[derive(Encode, Decode, Debug, PartialEq, Eq)]
+pub enum Destination {
+    Peers(Vec<PeerId>),
+    Peer(PeerId),
+    Host,
+    Broadcast,
 }

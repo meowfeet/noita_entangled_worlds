@@ -4,7 +4,6 @@
 //! `--new-game` throws away the saved run instead of continuing it. Stop with Ctrl+C.
 
 mod game_settings;
-mod lobby_code;
 mod net;
 mod player_cosmetics;
 mod protocol;
@@ -13,9 +12,8 @@ mod settings;
 
 use std::{env, path::PathBuf, process::exit, sync::atomic::Ordering, thread, time::Duration};
 
-use lobby_code::{LobbyCode, LobbyKind};
-use net::{NetManager, NetManagerInit, steam_networking::SteamPeer};
-use player_cosmetics::PlayerPngDesc;
+use net::steam_networking::{SteamPeer, parse_lobby_code};
+use net::{NetManager, NetManagerInit};
 use save_state::SaveState;
 use steamworks::{AppId, LobbyType};
 use tracing::{error, info};
@@ -43,13 +41,7 @@ fn main() {
     ctrlc::set_handler(|| net::RUNNING.store(false, Ordering::Relaxed))
         .expect("Ctrl+C handler can be set");
 
-    // Spacewar (480) is Steam's test app, usable without owning Noita on Steam.
-    let app_id = if settings::SPACEWARS {
-        480
-    } else {
-        NOITA_APP_ID
-    };
-    let client = steamworks::Client::init_app(app_id)
+    let client = steamworks::Client::init_app(NOITA_APP_ID)
         .unwrap_or_else(|err| fail(format!("Could not init Steam, is it running? {err}")));
     client.networking_utils().init_relay_network_access();
     if let Err(err) = client.networking_sockets().init_authentication() {
@@ -93,21 +85,6 @@ fn main() {
         info!("Could not find Noita's save folder");
     }
 
-    // Cosmetics are only allowed if they are unlocked in the save.
-    let flags = noita_save
-        .as_ref()
-        .map(|save| save.join(r"save00\persistent\flags"));
-    let unlocked = |flag: &str| flags.as_ref().is_none_or(|f| f.join(flag).exists());
-    let player_png_desc = PlayerPngDesc {
-        cosmetics: [
-            settings::CROWN && unlocked("secret_hat"),
-            settings::AMULET && unlocked("secret_amulet"),
-            settings::AMULET_GEM && unlocked("secret_amulet_gem"),
-        ],
-        colors: settings::PLAYER_COLOR,
-        invert_border: settings::INVERT_BORDER,
-    };
-
     let my_nickname = settings::NICKNAME
         .map(String::from)
         .unwrap_or_else(|| client.friends().get_friend(client.user().steam_id()).name());
@@ -131,20 +108,9 @@ fn main() {
             SteamPeer::new_host(lobby_type, client, max_players)
         }
         Some(code) => {
-            let code = LobbyCode::parse(&code)
-                .unwrap_or_else(|err| fail(format!("Invalid lobby code {code}: {err}")));
-            let my_kind = if settings::SPACEWARS {
-                LobbyKind::Gog
-            } else {
-                LobbyKind::Steam
-            };
-            if code.kind != my_kind {
-                fail(format!(
-                    "The host has SPACEWARS = {}, set the same in settings.rs",
-                    !settings::SPACEWARS
-                ));
-            }
-            SteamPeer::new_connect(code.code, client)
+            let lobby = parse_lobby_code(&code)
+                .unwrap_or_else(|| fail(format!("Invalid lobby code: {code}")));
+            SteamPeer::new_connect(lobby, client)
         }
     };
 
@@ -153,7 +119,6 @@ fn main() {
         NetManagerInit {
             my_nickname,
             save_state,
-            player_png_desc,
             mod_path,
             noita_save,
         },

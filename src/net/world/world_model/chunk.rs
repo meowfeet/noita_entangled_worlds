@@ -3,7 +3,7 @@ use std::num::NonZeroU16;
 use bitcode::{Decode, Encode};
 
 use super::{
-    CHUNK_SIZE, ChunkData,
+    CHUNK_AREA, ChunkData,
     encoding::{PixelRunner, RawPixel},
 };
 
@@ -102,35 +102,23 @@ impl Default for CompactPixel {
     }
 }
 
+/// Chunk of pixels. Stores pixels and tracks if they were changed.
 pub struct Chunk {
-    pixels: [u16; CHUNK_SQUARE],
-    // A plain bool array, deliberately, even though a bitset would be 2 KiB
-    // instead of 16 KiB. get/set run per pixel, while the size only matters on
-    // rehash and clone, and the u128 bitset measures ~6x slower on exactly this
-    // access pattern - see commit 71c934d3 which made this same call the first time.
-    changed: Changed<bool, CHUNK_SQUARE>,
+    pixels: [u16; CHUNK_AREA],
+    // A plain bool array, deliberately: a bitset is smaller, but measures ~6x
+    // slower for this per-pixel access pattern.
+    changed: [bool; CHUNK_AREA],
 }
 
-struct Changed<T: Default, const N: usize>([T; N]);
-const CHUNK_SQUARE: usize = CHUNK_SIZE * CHUNK_SIZE;
-impl Changed<bool, CHUNK_SQUARE> {
-    fn get(&self, n: usize) -> bool {
-        self.0[n]
-    }
-    fn set(&mut self, n: usize) {
-        self.0[n] = true
-    }
-}
 impl Default for Chunk {
     fn default() -> Self {
         Self {
-            pixels: [4095; CHUNK_SQUARE],
-            changed: Changed([false; CHUNK_SQUARE]),
+            pixels: [CompactPixel::UNKNOWN_RAW; CHUNK_AREA],
+            changed: [false; CHUNK_AREA],
         }
     }
 }
 
-/// Chunk of pixels. Stores pixels and tracks if they were changed.
 impl Chunk {
     pub fn pixel(&self, offset: usize) -> Pixel {
         Pixel::from_compact(CompactPixel::from_raw(self.pixels[offset]))
@@ -156,24 +144,20 @@ impl Chunk {
         }
     }
     pub fn changed(&self, offset: usize) -> bool {
-        self.changed.get(offset)
+        self.changed[offset]
     }
 
     pub fn mark_changed(&mut self, offset: usize) {
-        // This used to also store to a `crc: AtomicCell<Option<u64>>`, which is
-        // 16 bytes and therefore *not* lock-free - every changed pixel took a
-        // lock in crossbeam's process-global seqlock table, contended across the
-        // rayon terraforming workers. The field was never read.
-        self.changed.set(offset);
+        self.changed[offset] = true;
     }
 
     pub fn clear_changed(&mut self) {
-        self.changed = Changed([false; CHUNK_SQUARE]);
+        self.changed = [false; CHUNK_AREA];
     }
 
     pub fn to_chunk_data(&self) -> ChunkData {
         let mut runner = PixelRunner::new();
-        for i in 0..CHUNK_SQUARE {
+        for i in 0..CHUNK_AREA {
             runner.put_pixel(self.compact_pixel(i))
         }
         let runs = runner.build();

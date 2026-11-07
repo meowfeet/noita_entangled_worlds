@@ -9,20 +9,14 @@ pub const REQUEST_AUTHORITY_RADIUS: i32 = 512;
 #[derive(Debug, Encode, Decode, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Gid(pub u64);
 
-// 32 bit locally unique id.
-#[derive(Debug, Encode, Decode, Clone, Copy, Hash, PartialEq, Eq)]
+/// 32 bit locally unique id.
+#[derive(Debug, Encode, Decode, Clone, Copy)]
 pub struct Lid(pub u32);
 
-#[derive(Debug, Encode, Decode, Clone, PartialEq)]
+#[derive(Debug, Encode, Decode, Clone)]
 pub enum EntitySpawnInfo {
     Filename(String),
     Serialized { data: Vec<u8> },
-}
-
-impl Default for EntitySpawnInfo {
-    fn default() -> Self {
-        Self::Filename(String::new())
-    }
 }
 
 #[derive(Debug, Encode, Decode, Clone)]
@@ -31,7 +25,6 @@ pub struct FullEntityData {
     pub pos: WorldPos,
     pub data: EntitySpawnInfo,
     pub wand: Option<Vec<u8>>,
-    //pub rotation: f32,
     pub hp: f32,
     pub max_hp: Option<f32>,
     pub drops_gold: bool,
@@ -63,7 +56,7 @@ pub enum UpdateOrUpload {
 pub enum DesToProxy {
     DeleteEntity(Gid, Option<NonZero<isize>>),
     ReleaseAuthority(Gid),
-    RequestAuthority { pos: WorldPos }, //, radius: i32 },
+    RequestAuthority { pos: WorldPos },
     UpdatePosition(UpdateOrUpload),
     UpdatePositions(Vec<UpdateOrUpload>),
     TransferAuthorityTo(Gid, PeerId),
@@ -81,10 +74,9 @@ pub enum ProxyToDes {
 #[derive(Debug, Encode, Decode, Clone)]
 pub struct InterestRequest {
     pub pos: WorldPos,
-    //pub radius: i32,
 }
 
-#[derive(Debug, Encode, Decode, Clone, Copy, PartialEq)]
+#[derive(Debug, Encode, Decode, Clone, Copy)]
 pub struct PhysBodyInfo {
     pub x: f32,
     pub y: f32,
@@ -94,24 +86,22 @@ pub struct PhysBodyInfo {
     pub av: f32,
 }
 
-#[derive(Debug, Encode, Decode, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Encode, Decode, Clone)]
 pub enum EntityKind {
     /// Normal entity, replicated with a filename.
-    #[default]
     Normal,
-    // Item entity, can be picked up.
+    /// Item entity, can be picked up.
     Item,
 }
 
-#[derive(Debug, Encode, Decode, Clone, PartialEq, Copy, Default)]
+#[derive(Debug, Encode, Decode, Clone, Copy)]
 pub enum Target {
     Peer(PeerId),
     Gid(Gid),
-    #[default]
     None,
 }
 
-#[derive(Debug, Encode, Decode, Clone, PartialEq, Default)]
+#[derive(Debug, Encode, Decode, Clone)]
 pub struct EntityInfo {
     pub spawn_info: EntitySpawnInfo,
     pub kind: EntityKind,
@@ -139,8 +129,10 @@ pub struct EntityInfo {
     pub laser: Target,
     pub ai_rotation: f32,
     pub facing_direction: (bool, bool),
-    pub is_enabled: bool, //for kolmi/runestones/etc
-    pub counter: u8,      //for mom orbs/dragon has death script/etc
+    /// For kolmi, runestones etc.
+    pub is_enabled: bool,
+    /// For mom orbs, the dragon's death script etc.
+    pub counter: u8,
     pub synced_var: Vec<(String, String, i32, f32, bool)>,
 }
 
@@ -151,18 +143,15 @@ pub struct EntityInit {
     pub gid: Gid,
 }
 
-//TODO authority transfers should serialize entities probably
 #[derive(Debug, Encode, Decode, Clone)]
 pub enum EntityUpdate {
     /// Sets the gid that following EntityUpdates will act on.
     CurrentEntity(Lid),
-    // TODO diffing for position
     SetPosition(f32, f32),
     SetRotation(f32),
     SetVelocity(f32, f32),
     SetHp(f32),
     SetPhysInfo(Vec<Option<PhysBodyInfo>>),
-    // TODO...
     RemoveEntity(Lid),
     LocalizeEntity(Lid, PeerId),
     KillEntity {
@@ -203,7 +192,6 @@ pub enum RemoteDes {
     CameraPos(WorldPos),
     DeadEntities(Vec<(WorldPos, SpawnOnce)>),
     SpawnOnce(WorldPos, SpawnOnce),
-    //AllEntities(Vec<Lid>),
     ChestOpen(Gid, i32, i32, String, f32, f32),
     ChestOpenRequest(Gid, i32, i32, String, f32, f32),
 }

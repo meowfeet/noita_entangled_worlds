@@ -1,5 +1,6 @@
 use std::mem;
 
+use crate::protocol::PeerId;
 use crate::protocol::des::{
     DesToProxy, FullEntityData, Gid, ProxyToDes, REQUEST_AUTHORITY_RADIUS, UpdateOrUpload,
     UpdatePosition,
@@ -11,10 +12,8 @@ use tracing::{info, warn};
 
 use crate::save_state::{SaveState, SaveStateEntry};
 
-use super::omni::OmniPeerId;
-
 #[derive(Encode, Decode, Default)]
-struct EntityStorage {
+pub struct EntityStorage {
     entities: FxHashMap<Gid, FullEntityData>,
 }
 
@@ -22,36 +21,30 @@ impl SaveStateEntry for EntityStorage {
     const FILENAME: &'static str = "des_entity_storage";
 }
 
-pub(crate) struct DesManager {
-    is_host: bool,
-    entity_storage: EntityStorage,
+/// Keeps track of the synced entities and who has authority over them.
+pub struct DesManager {
+    /// Saved by the host.
+    pub entity_storage: EntityStorage,
+    /// Entities without an authority, by position.
     rtree: RTree<GeomWithData<[i64; 2], Gid>>,
-    authority: FxHashMap<Gid, OmniPeerId>,
-    pending_messages: Vec<(OmniPeerId, ProxyToDes)>,
-    save_state: SaveState,
+    authority: FxHashMap<Gid, PeerId>,
+    pending_messages: Vec<(PeerId, ProxyToDes)>,
 }
 
 impl DesManager {
-    pub(crate) fn new(is_host: bool, save_state: SaveState) -> Self {
-        info!("Loading EntityStorage...");
+    pub fn new(save_state: &SaveState) -> Self {
         let entity_storage: EntityStorage = save_state.load().unwrap_or_default();
-
-        info!("Preparing elements...");
         let elements: Vec<_> = entity_storage
             .entities
             .iter()
             .map(|(&gid, ent)| GeomWithData::new(ent.pos.as_array(), gid))
             .collect();
-        info!("Building RTree of {} elements...", elements.len());
-        let rtree = RTree::bulk_load(elements);
-        info!("DesManager created!");
+        info!("Loaded {} synced entities", elements.len());
         Self {
             entity_storage,
-            rtree,
+            rtree: RTree::bulk_load(elements),
             authority: Default::default(),
             pending_messages: Vec::new(),
-            save_state,
-            is_host,
         }
     }
 
@@ -70,7 +63,7 @@ impl DesManager {
         }
     }
 
-    fn handle_update(&mut self, update: UpdateOrUpload, source: OmniPeerId) {
+    fn handle_update(&mut self, update: UpdateOrUpload, source: PeerId) {
         match update {
             UpdateOrUpload::Upload(full_entity_data) => {
                 self.authority.insert(full_entity_data.gid, source);
@@ -105,7 +98,7 @@ impl DesManager {
         }
     }
 
-    pub(crate) fn handle_noita_msg(&mut self, source: OmniPeerId, msg: DesToProxy) {
+    pub fn handle_noita_msg(&mut self, source: PeerId, msg: DesToProxy) {
         // TODO maybe check that authorities are correct?
         match msg {
             DesToProxy::UpdateWand(gid, wand) => {
@@ -165,10 +158,9 @@ impl DesManager {
             }
             DesToProxy::TransferAuthorityTo(gid, peer_id) => {
                 if let Some(entity) = self.entity_storage.entities.get(&gid).cloned() {
-                    //info!("Transferring authority over entity from {source:?} to {peer_id:?}");
-                    self.authority.insert(gid, peer_id.into());
+                    self.authority.insert(gid, peer_id);
                     self.pending_messages
-                        .push((peer_id.into(), ProxyToDes::GotAuthority(entity)));
+                        .push((peer_id, ProxyToDes::GotAuthority(entity)));
                 } else {
                     warn!("Failed to find entity {gid:?} to transfer authority");
                 }
@@ -176,7 +168,7 @@ impl DesManager {
         }
     }
 
-    pub(crate) fn noita_disconnected(&mut self, source: OmniPeerId) {
+    pub fn noita_disconnected(&mut self, source: PeerId) {
         // TODO also remove entities from affected clients faster.
         info!("Peer {source} disconnected, freeing entities that were under authority");
         let mut free_again = Vec::new();
@@ -192,22 +184,14 @@ impl DesManager {
         }
     }
 
-    pub(crate) fn pending_messages(&mut self) -> Vec<(OmniPeerId, ProxyToDes)> {
+    pub fn pending_messages(&mut self) -> Vec<(PeerId, ProxyToDes)> {
         mem::take(&mut self.pending_messages)
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.entity_storage = Default::default();
         self.rtree = RTree::default();
         self.authority.clear();
         self.pending_messages.clear();
-    }
-}
-
-impl Drop for DesManager {
-    fn drop(&mut self) {
-        if self.is_host {
-            self.save_state.save(&self.entity_storage);
-        }
     }
 }

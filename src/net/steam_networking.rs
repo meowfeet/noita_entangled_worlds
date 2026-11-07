@@ -1,30 +1,79 @@
 use std::{
     collections::{HashMap, VecDeque},
     mem,
-    sync::{Mutex, mpsc},
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
 use steamworks::{
     CallbackHandle, LobbyChatUpdate, LobbyId, LobbyType, SteamError, SteamId,
-    networking_sockets::{ListenSocket, NetPollGroup},
+    networking_sockets::{ListenSocket, NetConnection, NetPollGroup},
     networking_types::{
-        ListenSocketEvent, NetworkingConnectionState, NetworkingIdentity, SendFlags,
+        ListenSocketEvent, NetworkingConnectionState, NetworkingIdentity, NetworkingMessage,
+        SendFlags,
     },
 };
 use tracing::{error, info, warn};
 
-use crate::{
-    lobby_code::{LobbyCode, LobbyKind},
-    settings,
-};
-
-use super::omni::{OmniNetworkEvent, OmniPeerId, Reliability};
+use crate::protocol::PeerId;
 
 /// Stored in the lobby data; only proxies with the same version can join each other.
 /// The "-cli" keeps official proxies out, their network format is different.
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-cli");
+
+/// All lobby ids share these high bits, so lobby codes leave them out.
+const LOBBY_CODE_BASE: u64 = 0x0186000000000000;
+
+/// The code friends join with: the lobby id in hex, without the shared high bits.
+fn lobby_code(id: LobbyId) -> String {
+    format!("{:x}", id.raw().wrapping_sub(LOBBY_CODE_BASE))
+}
+
+pub fn parse_lobby_code(code: &str) -> Option<LobbyId> {
+    let code = u64::from_str_radix(code.trim(), 16).ok()?;
+    Some(LobbyId::from_raw(code.wrapping_add(LOBBY_CODE_BASE)))
+}
+
+impl From<SteamId> for PeerId {
+    fn from(value: SteamId) -> Self {
+        Self(value.raw())
+    }
+}
+
+impl From<PeerId> for SteamId {
+    fn from(value: PeerId) -> Self {
+        Self::from_raw(value.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Reliability {
+    /// Message will be delivered at most once.
+    Unreliable,
+    /// Message will be resent until its arrival is confirmed.
+    Reliable,
+}
+
+impl Reliability {
+    pub fn from_reliability_bool(reliable: bool) -> Reliability {
+        if reliable {
+            Reliability::Reliable
+        } else {
+            Reliability::Unreliable
+        }
+    }
+}
+
+pub enum NetworkEvent {
+    PeerConnected(PeerId),
+    PeerDisconnected(PeerId),
+    Message {
+        src: PeerId,
+        data: Vec<u8>,
+    },
+    /// Reliable messages to this peer have been backlogged for too long.
+    SendBacklogStuck(PeerId),
+}
 
 enum SteamEvent {
     LobbyCreatedOrJoined(LobbyId),
@@ -34,8 +83,8 @@ enum SteamEvent {
     PeerStateChanged,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerState {
+#[derive(PartialEq)]
+enum PeerState {
     PendingConnection,
     CreatingMesh,
     Connected,
@@ -43,17 +92,10 @@ pub enum PeerState {
     Failed(String),
 }
 
-pub struct InnerState {
-    lobby_id: Option<LobbyId>,
-    host_id: SteamId,
-    remote_peers: Vec<SteamId>,
-    state: PeerState,
-}
-
 enum ConnectionState {
     AwaitingIncoming,
-    NetConnectionPending(steamworks::networking_sockets::NetConnection),
-    NetConnection(steamworks::networking_sockets::NetConnection),
+    NetConnectionPending(NetConnection),
+    NetConnection(NetConnection),
 }
 impl ConnectionState {
     fn switch_to_connected(&mut self) {
@@ -62,7 +104,7 @@ impl ConnectionState {
             *self = ConnectionState::NetConnection(conn);
         }
     }
-    fn connection(&self) -> Option<&steamworks::networking_sockets::NetConnection> {
+    fn connection(&self) -> Option<&NetConnection> {
         if let ConnectionState::NetConnection(conn) = self {
             Some(conn)
         } else {
@@ -155,12 +197,12 @@ struct Connections {
 
     my_id: SteamId,
     listen_socket: ListenSocket,
-    poll_group: Mutex<NetPollGroup>,
+    poll_group: NetPollGroup,
 
-    peers: DashMap<SteamId, ConnectionState>,
-    connected: Mutex<Vec<SteamId>>,
-    /// Lock before `peers` when taking both.
-    backlogs: Mutex<HashMap<SteamId, SendBacklog>>,
+    peers: HashMap<SteamId, ConnectionState>,
+    /// Peers whose connection just got established, reported by `SteamPeer::recv`.
+    connected: Vec<SteamId>,
+    backlogs: HashMap<SteamId, SendBacklog>,
 }
 
 impl Connections {
@@ -170,7 +212,7 @@ impl Connections {
         let listen_socket = networking_sockets
             .create_listen_socket_p2p(0, None)
             .expect("handle to be valid"); // Unclear in what cases this can fail.
-        let poll_group = networking_sockets.create_poll_group().into();
+        let poll_group = networking_sockets.create_poll_group();
         Connections {
             client: client.clone(),
 
@@ -178,14 +220,15 @@ impl Connections {
             listen_socket,
             poll_group,
 
-            peers: Default::default(),
-            connected: Default::default(),
-            backlogs: Default::default(),
+            peers: HashMap::new(),
+            connected: Vec::new(),
+            backlogs: HashMap::new(),
         }
     }
+
     fn flush(&self) {
-        for i in &self.peers {
-            if let Some(c) = i.connection()
+        for state in self.peers.values() {
+            if let Some(c) = state.connection()
                 && let Err(err) = c.flush_messages()
             {
                 warn!("Error while flushing a message: {err:?}")
@@ -193,7 +236,7 @@ impl Connections {
         }
     }
 
-    fn poll_listener(&self) {
+    fn poll_listener(&mut self) {
         while let Some(event) = self.listen_socket.try_receive_event() {
             match event {
                 ListenSocketEvent::Connecting(event) => {
@@ -204,14 +247,14 @@ impl Connections {
                         .ok();
                 }
                 ListenSocketEvent::Connected(event) => {
-                    if let Some(mut connection) = event
+                    if let Some(connection) = event
                         .remote()
                         .steam_id()
                         .and_then(|x| self.peers.get_mut(&x))
                     {
                         info!("Peer {:?} got connected event", event.remote());
                         let taken_connection = event.take_connection();
-                        taken_connection.set_poll_group(&self.poll_group.lock().unwrap());
+                        taken_connection.set_poll_group(&self.poll_group);
                         *connection = ConnectionState::NetConnectionPending(taken_connection);
                     }
                 }
@@ -225,13 +268,15 @@ impl Connections {
             }
         }
     }
-    fn poll_status(&self) -> bool {
+
+    /// Returns true if everyone is connected.
+    fn poll_status(&mut self) -> bool {
         let networking_sockets = self.client.networking_sockets();
         let mut all_connected = true;
-        // Postpone reconnect so we don't get deadlocked.
+        // Postponed, as reconnecting changes `peers` while we iterate it.
         let mut pending_reconnect = Vec::new();
-        for mut state in self.peers.iter_mut() {
-            match state.value() {
+        for (&peer, state) in self.peers.iter_mut() {
+            match state {
                 ConnectionState::AwaitingIncoming => {
                     all_connected = false;
                 }
@@ -247,12 +292,9 @@ impl Connections {
                         }
                         // Switch to connected state.
                         NetworkingConnectionState::Connected => {
-                            info!(
-                                "Connection of peer {:?} swithed to connected state",
-                                *state.key()
-                            );
-                            self.connected.lock().unwrap().push(*state.key());
-                            state.value_mut().switch_to_connected();
+                            info!("Connection of peer {:?} swithed to connected state", peer);
+                            self.connected.push(peer);
+                            state.switch_to_connected();
                             all_connected = false;
                         }
 
@@ -261,9 +303,9 @@ impl Connections {
                         | NetworkingConnectionState::ProblemDetectedLocally => {
                             info!(
                                 "Some problem happened for peer {:?} while making connection. Will try to connect again.",
-                                *state.key()
+                                peer
                             );
-                            pending_reconnect.push(*state.key());
+                            pending_reconnect.push(peer);
                             all_connected = false;
                         }
                     }
@@ -278,7 +320,7 @@ impl Connections {
                             // Not supposed to happen, as we're in NetConnectionPending state while connecting.
                             warn!("Not supposed to be in connecting state here.");
                             // Still recreate connection.
-                            pending_reconnect.push(*state.key());
+                            pending_reconnect.push(peer);
                             all_connected = false;
                         }
                         NetworkingConnectionState::Connected => {
@@ -290,9 +332,9 @@ impl Connections {
                             // Something broke, we need to recreate the connection.
                             info!(
                                 "Some problem happened for peer {:?} while connection was established. Will try to connect again.",
-                                *state.key()
+                                peer
                             );
-                            pending_reconnect.push(*state.key());
+                            pending_reconnect.push(peer);
                             // TODO: signal that reconnect happened.
                             // Several things should be reset on it, as we certainly lost several messages during it.
                             all_connected = false;
@@ -309,12 +351,12 @@ impl Connections {
     }
 
     /// Returns true if everyone is connected.
-    fn poll(&self) -> bool {
+    fn poll(&mut self) -> bool {
         self.poll_listener();
         self.poll_status()
     }
 
-    fn connect(&self, peer: SteamId) {
+    fn connect(&mut self, peer: SteamId) {
         let networking_sockets = self.client.networking_sockets();
         let peer_identity = NetworkingIdentity::new_steam_id(peer);
         if peer > self.my_id {
@@ -325,23 +367,24 @@ impl Connections {
             let connection = networking_sockets
                 .connect_p2p(peer_identity, 0, None)
                 .expect("handle to be valid");
-            connection.set_poll_group(&self.poll_group.lock().unwrap());
+            connection.set_poll_group(&self.poll_group);
             self.peers
                 .insert(peer, ConnectionState::NetConnectionPending(connection));
         }
     }
-    fn disconnect(&self, id: SteamId) {
+
+    fn disconnect(&mut self, id: SteamId) {
         info!("Removing connection to peer {:?}", id);
         self.peers.remove(&id);
-        self.backlogs.lock().unwrap().remove(&id);
+        self.backlogs.remove(&id);
     }
 
-    fn recv(&self) -> Vec<steamworks::networking_types::NetworkingMessage> {
-        self.poll_group.lock().unwrap().receive_messages(1024)
+    fn recv(&mut self) -> Vec<NetworkingMessage> {
+        self.poll_group.receive_messages(1024)
     }
 
     fn send_message(
-        &self,
+        &mut self,
         peer: SteamId,
         reliability: Reliability,
         msg: &[u8],
@@ -349,9 +392,8 @@ impl Connections {
         if reliability == Reliability::Unreliable {
             return self.send_now(peer, SendFlags::UNRELIABLE, msg);
         }
-        let mut backlogs = self.backlogs.lock().unwrap();
         // Don't overtake anything already waiting.
-        if let Some(backlog) = backlogs.get_mut(&peer) {
+        if let Some(backlog) = self.backlogs.get_mut(&peer) {
             backlog.push(msg.to_vec());
             return Ok(());
         }
@@ -361,7 +403,8 @@ impl Connections {
                     "Steam's send buffer for peer {:?} is full; holding reliable messages to it until there is room",
                     peer
                 );
-                backlogs.insert(peer, SendBacklog::new(msg.to_vec(), Instant::now()));
+                self.backlogs
+                    .insert(peer, SendBacklog::new(msg.to_vec(), Instant::now()));
                 Ok(())
             }
             res => res,
@@ -370,15 +413,13 @@ impl Connections {
 
     /// Retries every backlog. Returns the peers whose backlog timed out; those
     /// backlogs are dropped.
-    fn drain_backlogs(&self) -> Vec<SteamId> {
+    fn drain_backlogs(&mut self) -> Vec<SteamId> {
         let now = Instant::now();
         let mut stuck = Vec::new();
-        self.backlogs.lock().unwrap().retain(|&peer, backlog| {
-            let entry = self.peers.get(&peer);
+        let peers = &self.peers;
+        self.backlogs.retain(|&peer, backlog| {
             // Not `send_now`: it reports success when the peer isn't connected yet.
-            let connection = entry
-                .as_ref()
-                .and_then(|state| state.value().connection());
+            let connection = peers.get(&peer).and_then(|state| state.connection());
             let state = backlog.drain(now, |msg| match connection {
                 Some(connection) => connection
                     .send_message(msg, SendFlags::RELIABLE)
@@ -426,7 +467,7 @@ impl Connections {
 
     fn send_now(&self, peer: SteamId, send_flags: SendFlags, msg: &[u8]) -> Result<(), SteamError> {
         if let Some(peer) = self.peers.get(&peer) {
-            if let Some(connection) = peer.value().connection() {
+            if let Some(connection) = peer.connection() {
                 connection.send_message(msg, send_flags)?;
                 Ok(())
             } else {
@@ -446,31 +487,27 @@ pub struct SteamPeer {
     sender: mpsc::Sender<SteamEvent>,
     my_id: SteamId,
     is_host: bool,
-    inner: Mutex<InnerState>,
+    lobby_id: Option<LobbyId>,
+    host_id: SteamId,
+    remote_peers: Vec<SteamId>,
+    state: PeerState,
     _cbs: Vec<CallbackHandle>,
 
     connections: Connections,
 }
 
 impl SteamPeer {
-    pub fn flush(&self) {
-        self.connections.flush()
-    }
-
     pub fn new_host(lobby_type: LobbyType, client: steamworks::Client, max_players: u32) -> Self {
         let (sender, events) = mpsc::channel();
-
-        let connections = Connections::new(&client);
-
-        let matchmaking = client.matchmaking();
         {
             let sender = sender.clone();
-            matchmaking.create_lobby(lobby_type, max_players, {
-                let client = client.clone();
-                move |lobby| {
+            let lobby_client = client.clone();
+            client
+                .matchmaking()
+                .create_lobby(lobby_type, max_players, move |lobby| {
                     let event = match lobby {
                         Ok(id) => {
-                            client
+                            lobby_client
                                 .matchmaking()
                                 .set_lobby_data(id, "ew_version", VERSION);
                             SteamEvent::LobbyCreatedOrJoined(id)
@@ -478,87 +515,79 @@ impl SteamPeer {
                         Err(err) => SteamEvent::Failed(format!("Could not create lobby: {err}")),
                     };
                     sender.send(event).ok();
-                }
-            });
+                });
         }
-
-        Self::new(client, sender, events, connections, true)
+        Self::new(client, sender, events, true)
     }
 
     pub fn new_connect(lobby: LobbyId, client: steamworks::Client) -> Self {
         let (sender, events) = mpsc::channel();
-        let connections = Connections::new(&client);
-        let matchmaking = client.matchmaking();
         {
             let sender = sender.clone();
-
-            matchmaking.join_lobby(lobby, {
-                let client = client.clone();
-                move |lobby| {
-                    let event = match lobby {
-                        Ok(id) => match client.matchmaking().lobby_data(id, "ew_version").as_deref() {
-                            Some(VERSION) => SteamEvent::LobbyCreatedOrJoined(id),
-                            Some(remote) => SteamEvent::Failed(format!(
-                                "Lobby was created by proxy with a different version: {remote}. You have {VERSION}."
-                            )),
-                            None => SteamEvent::Failed(
-                                "Lobby does not have a version field. The lobby was created by an old proxy version."
-                                    .to_string(),
-                            ),
-                        },
-                        Err(_) => SteamEvent::Failed(
-                            "Lobby does not exist. Make sure SPACEWARS in settings.rs matches the host's."
+            let lobby_client = client.clone();
+            client.matchmaking().join_lobby(lobby, move |lobby| {
+                let event = match lobby {
+                    Ok(id) => match lobby_client
+                        .matchmaking()
+                        .lobby_data(id, "ew_version")
+                        .as_deref()
+                    {
+                        Some(VERSION) => SteamEvent::LobbyCreatedOrJoined(id),
+                        Some(remote) => SteamEvent::Failed(format!(
+                            "Lobby was created by proxy with a different version: {remote}. You have {VERSION}."
+                        )),
+                        None => SteamEvent::Failed(
+                            "Lobby does not have a version field. The lobby was created by an old proxy version."
                                 .to_string(),
                         ),
-                    };
-
-                    sender.send(event).ok();
-                }
+                    },
+                    Err(_) => SteamEvent::Failed("Lobby does not exist.".to_string()),
+                };
+                sender.send(event).ok();
             });
         }
-
-        Self::new(client, sender, events, connections, false)
+        Self::new(client, sender, events, false)
     }
 
     fn new(
         client: steamworks::Client,
         sender: mpsc::Sender<SteamEvent>,
         events: mpsc::Receiver<SteamEvent>,
-        connections: Connections,
         is_host: bool,
     ) -> Self {
         let my_id = client.user().steam_id();
         let _cbs = make_callbacks(&sender, &client);
         Self {
+            connections: Connections::new(&client),
             my_id,
             client,
-
             events,
             sender,
             is_host,
-            inner: Mutex::new(InnerState {
-                lobby_id: None,
-                host_id: my_id,
-                remote_peers: Vec::new(),
-                state: PeerState::PendingConnection,
-            }),
+            lobby_id: None,
+            // Replaced by the lobby owner once a client joined.
+            host_id: my_id,
+            remote_peers: Vec::new(),
+            state: PeerState::PendingConnection,
             _cbs,
-            connections,
         }
     }
 
+    pub fn flush(&self) {
+        self.connections.flush()
+    }
+
     pub fn send(
-        &self,
-        peer: OmniPeerId,
+        &mut self,
+        peer: PeerId,
         msg: &[u8],
         reliability: Reliability,
     ) -> Result<(), SteamError> {
         self.connections.send_message(peer.into(), reliability, msg)
     }
 
-    pub fn broadcast(&self, msg: &[u8], reliability: Reliability) {
-        let peers = self.inner.lock().unwrap().remote_peers.clone();
-        for peer in peers {
+    pub fn broadcast(&mut self, msg: &[u8], reliability: Reliability) {
+        for &peer in &self.remote_peers {
             if let Err(err) = self.connections.send_message(peer, reliability, msg) {
                 warn!(
                     "Couldn't send a packet to {:?}, st {:?}, err {}",
@@ -568,92 +597,75 @@ impl SteamPeer {
         }
     }
 
-    pub fn recv(&self) -> Vec<OmniNetworkEvent> {
+    pub fn recv(&mut self) -> Vec<NetworkEvent> {
         let all_connected = self.connections.poll();
-        if all_connected && self.inner.lock().unwrap().state == PeerState::CreatingMesh {
+        if all_connected && self.state == PeerState::CreatingMesh {
             info!("Switched to `all connected` state");
-            self.inner.lock().unwrap().state = PeerState::Connected;
+            self.state = PeerState::Connected;
         }
         let mut returned_events = Vec::new();
         for peer in self.connections.drain_backlogs() {
-            returned_events.push(OmniNetworkEvent::SendBacklogStuck(peer.into()));
+            returned_events.push(NetworkEvent::SendBacklogStuck(peer.into()));
         }
-        for event in self.events.try_iter() {
+        while let Ok(event) = self.events.try_recv() {
             match event {
                 SteamEvent::LobbyCreatedOrJoined(id) => {
                     info!("Lobby ready");
-                    self.inner.lock().unwrap().lobby_id = Some(id);
+                    self.lobby_id = Some(id);
                     if self.is_host {
-                        let kind = if settings::SPACEWARS {
-                            LobbyKind::Gog
-                        } else {
-                            LobbyKind::Steam
-                        };
-                        println!("Lobby code: {}", LobbyCode { kind, code: id }.serialize());
+                        println!("Lobby code: {}", lobby_code(id));
                     } else {
-                        let host_id = self.client.matchmaking().lobby_owner(id);
-                        self.inner.lock().unwrap().host_id = host_id;
-                        info!("Got host id: {:?}", host_id)
+                        self.host_id = self.client.matchmaking().lobby_owner(id);
+                        info!("Got host id: {:?}", self.host_id)
                     }
                     self.update_lobby_list();
                     info!("Switched to `creating mesh` state");
-                    self.inner.lock().unwrap().state = PeerState::CreatingMesh;
+                    self.state = PeerState::CreatingMesh;
                 }
-                SteamEvent::Failed(err) => {
-                    self.inner.lock().unwrap().state = PeerState::Failed(err);
-                }
-                SteamEvent::PeerConnectedToLobby(id) => {
-                    self.connections.connect(id);
-                }
+                SteamEvent::Failed(err) => self.state = PeerState::Failed(err),
+                SteamEvent::PeerConnectedToLobby(id) => self.connections.connect(id),
                 SteamEvent::PeerDisconnectedFromLobby(id) => {
                     self.connections.disconnect(id);
-                    returned_events.push(OmniNetworkEvent::PeerDisconnected(id.into()))
+                    returned_events.push(NetworkEvent::PeerDisconnected(id.into()))
                 }
                 SteamEvent::PeerStateChanged => self.update_lobby_list(),
             }
         }
 
-        let messages = self.connections.recv();
-        for message in messages {
+        for message in self.connections.recv() {
             let steam_id = message
                 .identity_peer()
                 .steam_id()
                 .expect("only steam ids are supported");
-            returned_events.push(OmniNetworkEvent::Message {
+            returned_events.push(NetworkEvent::Message {
                 src: steam_id.into(),
-                data: message.data().to_vec(), // TODO eliminate clone here.
+                data: message.data().to_vec(),
             })
         }
-        let mut fully_connected = self.connections.connected.lock().unwrap();
-        for steam_id in fully_connected.iter() {
-            returned_events.push(OmniNetworkEvent::PeerConnected((*steam_id).into()))
+        for steam_id in self.connections.connected.drain(..) {
+            returned_events.push(NetworkEvent::PeerConnected(steam_id.into()))
         }
-        fully_connected.clear();
 
         returned_events
     }
 
-    fn update_lobby_list(&self) {
+    fn update_lobby_list(&mut self) {
         info!("Updating peer list");
-        let matchmaking = self.client.matchmaking();
-        let lobby = self.inner.lock().unwrap().lobby_id;
-        let mut peers = match lobby {
-            Some(lobby_id) => matchmaking.lobby_members(lobby_id),
+        let mut peers = match self.lobby_id {
+            Some(lobby_id) => self.client.matchmaking().lobby_members(lobby_id),
             None => Vec::new(),
         };
         peers.retain(|x| *x != self.my_id);
         peers.sort();
-        let current_peers = &mut self.inner.lock().unwrap().remote_peers;
 
-        // TODO: could be done more efficiently
         for peer in &peers {
-            if !current_peers.contains(peer) {
+            if !self.remote_peers.contains(peer) {
                 self.sender
                     .send(SteamEvent::PeerConnectedToLobby(*peer))
                     .ok();
             }
         }
-        for peer in &mut *current_peers {
+        for peer in &self.remote_peers {
             if !peers.contains(peer) {
                 self.sender
                     .send(SteamEvent::PeerDisconnectedFromLobby(*peer))
@@ -661,32 +673,28 @@ impl SteamPeer {
             }
         }
 
-        *current_peers = peers;
-        info!("Current peer list: {:?}", current_peers);
+        self.remote_peers = peers;
+        info!("Current peer list: {:?}", self.remote_peers);
     }
 
-    pub fn my_id(&self) -> OmniPeerId {
+    pub fn my_id(&self) -> PeerId {
         self.my_id.into()
     }
 
-    pub fn host_id(&self) -> OmniPeerId {
-        if self.is_host {
-            self.my_id.into()
-        } else {
-            self.inner.lock().unwrap().host_id.into()
-        }
-    }
-
-    pub fn lobby_id(&self) -> Option<LobbyId> {
-        self.inner.lock().unwrap().lobby_id
-    }
-
-    pub fn state(&self) -> PeerState {
-        self.inner.lock().unwrap().state.clone()
+    pub fn host_id(&self) -> PeerId {
+        self.host_id.into()
     }
 
     pub fn is_host(&self) -> bool {
         self.is_host
+    }
+
+    /// Why creating or joining the lobby failed, if it did.
+    pub fn error(&self) -> Option<&str> {
+        match &self.state {
+            PeerState::Failed(err) => Some(err),
+            _ => None,
+        }
     }
 }
 
@@ -694,27 +702,23 @@ fn make_callbacks(
     sender: &mpsc::Sender<SteamEvent>,
     client: &steamworks::Client,
 ) -> Vec<CallbackHandle> {
-    {
-        client
-            .networking_messages()
-            .session_request_callback(|req| {
-                info!("Accepting connection with {:?}", req.remote());
-                req.accept();
-            });
-    };
-    let cb_ch = {
-        let sender = sender.clone();
-        client.register_callback(move |update: LobbyChatUpdate| {
-            info!("User state changed {:?}", update);
-            sender.send(SteamEvent::PeerStateChanged).ok();
-        })
-    };
+    client
+        .networking_messages()
+        .session_request_callback(|req| {
+            info!("Accepting connection with {:?}", req.remote());
+            req.accept();
+        });
+    let sender = sender.clone();
+    let cb_ch = client.register_callback(move |update: LobbyChatUpdate| {
+        info!("User state changed {:?}", update);
+        sender.send(SteamEvent::PeerStateChanged).ok();
+    });
     vec![cb_ch]
 }
 
 impl Drop for SteamPeer {
     fn drop(&mut self) {
-        if let Some(lobby) = self.lobby_id() {
+        if let Some(lobby) = self.lobby_id {
             self.client.matchmaking().leave_lobby(lobby);
         }
     }

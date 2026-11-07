@@ -1,33 +1,37 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{self, AtomicBool},
-    },
 };
 
+use bitcode::{Decode, Encode};
 use tracing::{error, info, warn};
-
-use crate::net::RunInfo;
 
 pub trait SaveStateEntry: bitcode::Encode + bitcode::DecodeOwned {
     const FILENAME: &'static str;
 }
 
-struct SaveStateInner {
-    game_started: AtomicBool,
+/// The run's seed. Without it there is no run to continue.
+#[derive(Encode, Decode)]
+pub struct RunInfo {
+    pub seed: u64,
 }
 
-/// Allows persisting extra run state (like chunks). Cleared between runs.
-#[derive(Clone)]
+impl SaveStateEntry for RunInfo {
+    /// Bump whenever any save state format changes incompatibly: `SaveState` discards a save
+    /// directory that has no run info under this name.
+    const FILENAME: &'static str = "run_info_v2";
+}
+
+/// The host's run (seed, flags, world, entities) on disk, so it can be continued after a restart.
 pub struct SaveState {
-    inner: Arc<SaveStateInner>,
     path: PathBuf,
+    /// Nothing is saved before Noita connected, so starting and stopping the proxy
+    /// without playing doesn't leave a run behind.
+    game_started: bool,
 }
 
 impl SaveState {
-    pub(crate) fn new(path: impl AsRef<Path>) -> Self {
+    pub fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         let has_savestate = path.join(format!("{}.bit", RunInfo::FILENAME)).exists();
         info!("Has savestate: {has_savestate}");
@@ -44,14 +48,12 @@ impl SaveState {
         info!("Will save to: {}", path.display());
         Self {
             path,
-            inner: Arc::new(SaveStateInner {
-                game_started: false.into(),
-            }),
+            game_started: false,
         }
     }
 
-    pub(crate) fn save<D: SaveStateEntry>(&self, data: &D) {
-        if !self.inner.game_started.load(atomic::Ordering::SeqCst) {
+    pub fn save<D: SaveStateEntry>(&self, data: &D) {
+        if !self.game_started {
             info!("Skipping save of {}, game not started yet", D::FILENAME);
             return;
         }
@@ -65,7 +67,7 @@ impl SaveState {
         info!("Saved {}", path.display());
     }
 
-    pub(crate) fn load<D: SaveStateEntry>(&self) -> Option<D> {
+    pub fn load<D: SaveStateEntry>(&self) -> Option<D> {
         let path = self.path_for_filename(D::FILENAME);
         let data = fs::read(&path)
             .inspect_err(|err| {
@@ -84,13 +86,11 @@ impl SaveState {
             .ok()
     }
 
-    pub(crate) fn mark_game_started(&self) {
-        self.inner
-            .game_started
-            .store(true, atomic::Ordering::SeqCst);
+    pub fn mark_game_started(&mut self) {
+        self.game_started = true;
     }
 
-    pub(crate) fn reset(&self) {
+    pub fn reset(&self) {
         fs::remove_dir_all(&self.path).ok();
         fs::create_dir_all(&self.path).ok();
     }

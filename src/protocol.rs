@@ -3,10 +3,9 @@
 
 use bitcode::{Decode, Encode};
 
-pub mod message_socket;
-
 pub mod basic_types;
 pub mod des;
+pub mod message_socket;
 
 pub use basic_types::*;
 
@@ -41,11 +40,11 @@ pub enum NoitaOutbound {
     DesToProxy(des::DesToProxy),
     RemoteMessage {
         reliable: bool,
-        destination: Destination<PeerId>,
+        destination: Destination,
         message: RemoteMessage,
     },
 }
-#[derive(Debug, Clone, Copy, Encode, Decode, PartialEq)]
+#[derive(Debug, Clone, Copy, Encode, Decode)]
 pub enum GameEffectEnum {
     None,
     Electrocution,
@@ -142,14 +141,4 @@ pub enum GameEffectData {
     Normal(GameEffectEnum),
     Custom(String),
     Projectile((String, Vec<u8>)),
-}
-impl PartialEq for GameEffectData {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (GameEffectData::Normal(e1), GameEffectData::Normal(e2)) => e1 == e2,
-            (GameEffectData::Custom(e1), GameEffectData::Custom(e2)) => e1 == e2,
-            (GameEffectData::Projectile((e1, _)), GameEffectData::Projectile((e2, _))) => e1 == e2,
-            _ => false,
-        }
-    }
 }

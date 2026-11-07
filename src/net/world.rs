@@ -1,12 +1,11 @@
 use bitcode::{Decode, Encode};
 use rand::{RngExt, rng};
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 use std::{cmp, mem};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use wide::f32x8;
 use world_model::{
     CHUNK_SIZE, ChunkCoord, ChunkData, ChunkDelta, WorldModel,
@@ -15,18 +14,13 @@ use world_model::{
 
 pub use world_model::encoding::NoitaWorldUpdate;
 
+use crate::protocol::{Destination, PeerId};
 use crate::save_state::{SaveState, SaveStateEntry};
-
-use super::{
-    CellType, ExplosionData,
-    messages::{Destination, MessageRequest},
-    omni::{OmniPeerId, Reliability},
-};
 
 pub mod world_model;
 
 #[derive(Debug, Decode, Encode, Clone)]
-pub(crate) enum WorldNetMessage {
+pub enum WorldNetMessage {
     // Authority request
     RequestAuthority {
         chunk: ChunkCoord,
@@ -47,7 +41,7 @@ pub(crate) enum WorldNetMessage {
     LoseAuthority {
         chunk: ChunkCoord,
         new_priority: u8,
-        new_authority: OmniPeerId,
+        new_authority: PeerId,
     },
     // Change priority
     ChangePriority {
@@ -76,7 +70,7 @@ pub(crate) enum WorldNetMessage {
     // When listening
     AuthorityAlreadyTaken {
         chunk: ChunkCoord,
-        authority: OmniPeerId,
+        authority: PeerId,
     },
     ListenRequest {
         chunk: ChunkCoord,
@@ -107,7 +101,7 @@ pub(crate) enum WorldNetMessage {
     // Authority transfer stuff (due to priority)
     GetAuthorityFrom {
         chunk: ChunkCoord,
-        current_authority: OmniPeerId,
+        current_authority: PeerId,
     },
     RequestAuthorityTransfer {
         chunk: ChunkCoord,
@@ -115,7 +109,7 @@ pub(crate) enum WorldNetMessage {
     TransferOk {
         chunk: ChunkCoord,
         chunk_data: Option<ChunkData>,
-        listeners: FxHashSet<OmniPeerId>,
+        listeners: FxHashSet<PeerId>,
     },
     TransferFailed {
         chunk: ChunkCoord,
@@ -132,12 +126,12 @@ enum ChunkState {
     /// Transitioning into Listening or Authority state.
     WaitingForAuthority,
     /// Listening for chunk updates from this peer.
-    Listening { authority: OmniPeerId, priority: u8 },
+    Listening { authority: PeerId, priority: u8 },
     /// Sending chunk updates to these listeners.
     Authority {
-        listeners: FxHashSet<OmniPeerId>,
+        listeners: FxHashSet<PeerId>,
         priority: u8,
-        new_authority: Option<(OmniPeerId, u8)>,
+        new_authority: Option<(PeerId, u8)>,
         stop_sending: bool,
     },
     /// Chunk is to be cleaned up.
@@ -146,7 +140,7 @@ enum ChunkState {
     Transfer,
     /// Has higher priority and is waiting for next chunk update
     WantToGetAuth {
-        authority: OmniPeerId,
+        authority: PeerId,
         auth_priority: u8,
         my_priority: u8,
     },
@@ -161,36 +155,28 @@ impl ChunkState {
         }
     }
 }
-// TODO handle exits.
-pub(crate) struct WorldManager {
+pub struct WorldManager {
     pub nice_terraforming: bool,
-    pub is_host: bool,
+    is_host: bool,
     my_pos: (i32, i32),
     cam_pos: (i32, i32),
     is_notplayer: bool,
-    my_peer_id: OmniPeerId,
-    pub save_state: SaveState,
+    my_peer_id: PeerId,
     /// We receive changes from other clients here, intending to send them to Noita.
     inbound_model: WorldModel,
     /// We use that to create changes to be sent to other clients.
     outbound_model: WorldModel,
-    /// Stores chunks that aren't under any authority.
-    chunk_storage: FxHashMap<ChunkCoord, ChunkData>,
+    /// Stores chunks that aren't under any authority. Saved by the host.
+    pub chunk_storage: FxHashMap<ChunkCoord, ChunkData>,
     /// Who is the current chunk authority.
-    authority_map: FxHashMap<ChunkCoord, (OmniPeerId, u8)>,
-    /// Chunk states, according to docs/distributed_world_sync.drawio
+    authority_map: FxHashMap<ChunkCoord, (PeerId, u8)>,
     chunk_state: FxHashMap<ChunkCoord, ChunkState>,
-    emitted_messages: Vec<MessageRequest<WorldNetMessage>>,
-    /// Which update it is?
-    /// Incremented every time `add_end()` gets called.
-    current_update: u64,
-    /// Update number in which chunk has been updated locally.
-    /// Used to track which chunks can be unloaded.
-    chunk_last_update: FxHashMap<ChunkCoord, u64>,
+    /// Messages for other peers, all sent reliably.
+    emitted_messages: Vec<(Destination, WorldNetMessage)>,
     /// Stores last priority we used for that chunk, in case transfer fails and we'll need to request authority normally.
     last_request_priority: FxHashMap<ChunkCoord, u8>,
     world_num: i32,
-    pub materials: FxHashMap<u16, (u32, u32, CellType, u32)>,
+    pub materials: FxHashMap<u16, Material>,
     is_storage_recent: FxHashSet<ChunkCoord>,
     explosion_pointer: FxHashMap<ChunkCoord, Vec<usize>>,
     explosion_data: Vec<(usize, usize, ExTarget, u64)>,
@@ -198,15 +184,14 @@ pub(crate) struct WorldManager {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-pub(crate) enum ExTarget {
+pub enum ExTarget {
     Ray(u64),
     Radius(u64),
     RayRad((u64, u64)),
 }
 
 impl WorldManager {
-    pub(crate) fn new(is_host: bool, my_peer_id: OmniPeerId, save_state: SaveState) -> Self {
-        let chunk_storage = save_state.load().unwrap_or_default();
+    pub fn new(is_host: bool, my_peer_id: PeerId, save_state: &SaveState) -> Self {
         WorldManager {
             nice_terraforming: true,
             is_host,
@@ -214,15 +199,12 @@ impl WorldManager {
             cam_pos: (i32::MIN / 2, i32::MIN / 2),
             is_notplayer: false,
             my_peer_id,
-            save_state,
             inbound_model: Default::default(),
             outbound_model: Default::default(),
             authority_map: Default::default(),
-            chunk_storage,
+            chunk_storage: save_state.load().unwrap_or_default(),
             chunk_state: Default::default(),
             emitted_messages: Default::default(),
-            current_update: 0,
-            chunk_last_update: Default::default(),
             last_request_priority: Default::default(),
             world_num: 0,
             materials: Default::default(),
@@ -233,24 +215,23 @@ impl WorldManager {
         }
     }
 
-    pub(crate) fn add_update(&mut self, update: NoitaWorldUpdate) {
+    pub fn add_update(&mut self, update: NoitaWorldUpdate) {
         self.outbound_model
             .apply_noita_update(&update, &mut self.is_storage_recent);
     }
 
-    pub(crate) fn add_end(&mut self, priority: u8, pos: &[i32]) {
+    pub fn add_end(&mut self, priority: u8, pos: &[i32]) {
         let updated_chunks = self
             .outbound_model
             .updated_chunks()
             .iter()
             .copied()
             .collect::<Vec<_>>();
-        self.current_update += 1;
-        let chunks_to_send: Vec<Vec<(OmniPeerId, u8)>> = updated_chunks
+        let chunks_to_send: Vec<Vec<(PeerId, u8)>> = updated_chunks
             .iter()
             .map(|chunk| self.chunk_updated_locally(*chunk, priority, pos))
             .collect();
-        let mut chunk_packet: HashMap<OmniPeerId, Vec<(ChunkDelta, u8)>> = HashMap::new();
+        let mut chunk_packet: HashMap<PeerId, Vec<(ChunkDelta, u8)>> = HashMap::new();
         for (chunk, who_sending) in updated_chunks.iter().zip(chunks_to_send.iter()) {
             let Some(delta) = self.outbound_model.get_chunk_delta(*chunk, false) else {
                 continue;
@@ -280,7 +261,7 @@ impl WorldManager {
         chunk: ChunkCoord,
         priority: u8,
         pos: &[i32],
-    ) -> Vec<(OmniPeerId, u8)> {
+    ) -> Vec<(PeerId, u8)> {
         if pos.len() == 6 {
             self.my_pos = (pos[0], pos[1]);
             self.cam_pos = (pos[2], pos[3]);
@@ -293,15 +274,14 @@ impl WorldManager {
             self.world_num = pos[0];
             self.reset();
         }
-        let entry = self.chunk_state.entry(chunk).or_insert_with(|| {
-            debug!("Created entry for {chunk:?}");
-            ChunkState::RequestAuthority {
+        let entry = self
+            .chunk_state
+            .entry(chunk)
+            .or_insert(ChunkState::RequestAuthority {
                 priority,
                 can_wait: true,
-            }
-        });
+            });
         let mut emit_queue = Vec::new();
-        self.chunk_last_update.insert(chunk, self.current_update);
         let mut chunks_to_send = Vec::new();
         match entry {
             ChunkState::Listening {
@@ -409,7 +389,7 @@ impl WorldManager {
         chunks_to_send
     }
 
-    pub(crate) fn update(&mut self) {
+    pub fn update(&mut self) {
         fn should_kill(
             my_pos: (i32, i32),
             cam_pos: (i32, i32),
@@ -430,11 +410,6 @@ impl WorldManager {
         }
         let mut emit_queue = Vec::new();
         for (&chunk, state) in self.chunk_state.iter_mut() {
-            let chunk_last_update = self
-                .chunk_last_update
-                .get(&chunk)
-                .copied()
-                .unwrap_or_default();
             match state {
                 ChunkState::RequestAuthority { priority, can_wait } => {
                     let priority = *priority;
@@ -448,7 +423,6 @@ impl WorldManager {
                     ));
                     *state = ChunkState::WaitingForAuthority;
                     self.last_request_priority.insert(chunk, priority);
-                    debug!("Requested authority for {chunk:?}")
                 }
                 // This state doesn't have much to do.
                 ChunkState::WaitingForAuthority => {
@@ -470,7 +444,6 @@ impl WorldManager {
                         chunk.1,
                         self.is_notplayer,
                     ) {
-                        debug!("Unloading [listening] chunk {chunk:?}");
                         emit_queue.push((
                             Destination::Peer(*authority),
                             WorldNetMessage::ListenStopRequest { chunk },
@@ -495,10 +468,6 @@ impl WorldManager {
                                 },
                             ));
                         }
-                        debug!(
-                            "Unloading [authority] chunk {chunk:?} (updates: {chunk_last_update} {})",
-                            self.current_update
-                        );
                         emit_queue.push((
                             Destination::Host,
                             WorldNetMessage::RelinquishAuthority {
@@ -518,7 +487,6 @@ impl WorldManager {
                         chunk.1,
                         self.is_notplayer,
                     ) {
-                        debug!("Unloading [want to get auth] chunk {chunk:?}");
                         *state = ChunkState::UnloadPending;
                     }
                 }
@@ -541,23 +509,22 @@ impl WorldManager {
         });
     }
 
-    pub(crate) fn get_noita_updates(&mut self) -> Vec<Vec<u8>> {
+    pub fn get_noita_updates(&mut self) -> Vec<Vec<u8>> {
         let updates = self.inbound_model.get_all_noita_updates();
         self.inbound_model.reset_change_tracking();
         updates
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.inbound_model.reset();
         self.outbound_model.reset();
         self.chunk_storage.clear();
         self.authority_map.clear();
-        self.chunk_last_update.clear();
         self.chunk_state.clear();
         self.is_storage_recent.clear();
     }
 
-    pub(crate) fn get_emitted_msgs(&mut self) -> Vec<MessageRequest<WorldNetMessage>> {
+    pub fn get_emitted_msgs(&mut self) -> Vec<(Destination, WorldNetMessage)> {
         mem::take(&mut self.emitted_messages)
     }
 
@@ -572,14 +539,10 @@ impl WorldManager {
             self.handle_msg(self.my_peer_id, msg.clone());
         }
 
-        self.emitted_messages.push(MessageRequest {
-            reliability: Reliability::Reliable,
-            dst,
-            msg,
-        })
+        self.emitted_messages.push((dst, msg))
     }
 
-    fn emit_got_authority(&mut self, chunk: ChunkCoord, source: OmniPeerId, priority: u8) {
+    fn emit_got_authority(&mut self, chunk: ChunkCoord, source: PeerId, priority: u8) {
         let auth = self.authority_map.get(&chunk);
         let chunk_data = if auth
             .map(|a| a.0 != source) //TODO doesn't work
@@ -617,9 +580,9 @@ impl WorldManager {
     fn emit_transfer_authority(
         &mut self,
         chunk: ChunkCoord,
-        source: OmniPeerId,
+        source: PeerId,
         priority: u8,
-        current_authority: OmniPeerId,
+        current_authority: PeerId,
     ) {
         self.authority_map.insert(chunk, (source, priority));
         self.emit_msg(
@@ -631,7 +594,7 @@ impl WorldManager {
         );
     }
 
-    pub(crate) fn handle_msg(&mut self, source: OmniPeerId, msg: WorldNetMessage) {
+    pub fn handle_msg(&mut self, source: PeerId, msg: WorldNetMessage) {
         match msg {
             WorldNetMessage::RequestAuthority {
                 chunk,
@@ -646,25 +609,17 @@ impl WorldManager {
                 match current_authority {
                     Some((authority, priority_state)) => {
                         if source == authority {
-                            debug!("{source} already has authority of {chunk:?}");
                             self.emit_got_authority(chunk, source, priority);
                         } else if priority_state > priority && !can_wait {
-                            debug!("{source} is gaining priority over {chunk:?} from {authority}");
                             self.emit_transfer_authority(chunk, source, priority, authority);
                         } else {
-                            debug!(
-                                "{source} requested authority for {chunk:?}, but it's already taken by {authority}"
-                            );
                             self.emit_msg(
                                 Destination::Peer(source),
                                 WorldNetMessage::AuthorityAlreadyTaken { chunk, authority },
                             );
                         }
                     }
-                    None => {
-                        debug!("Granting {source} authority of {chunk:?}");
-                        self.emit_got_authority(chunk, source, priority);
-                    }
+                    None => self.emit_got_authority(chunk, source, priority),
                 }
             }
             WorldNetMessage::GetChunk { chunk, priority } => self.emit_msg(
@@ -714,20 +669,10 @@ impl WorldManager {
                     warn!("{} sent RequestAuthority to not-host.", source);
                     return;
                 }
-                let current_authority = self.authority_map.get(&chunk).copied();
-                match current_authority {
-                    Some((authority, _)) => {
-                        if source == authority {
-                            self.authority_map.insert(chunk, (source, priority));
-                        } else {
-                            debug!(
-                                "{source} requested authority for {chunk:?}, but it's already taken by {authority}"
-                            );
-                        }
-                    }
-                    None => {
-                        debug!("Granting {source} authority of {chunk:?}");
-                    }
+                if let Some((authority, _)) = self.authority_map.get(&chunk)
+                    && *authority == source
+                {
+                    self.authority_map.insert(chunk, (source, priority));
                 }
             }
             WorldNetMessage::GotAuthority {
@@ -791,9 +736,6 @@ impl WorldManager {
                 if let Some(state) = self.authority_map.get(&chunk)
                     && state.0 != source
                 {
-                    debug!(
-                        "{source} sent RelinquishAuthority for {chunk:?}, but isn't currently an authority"
-                    );
                     return;
                 }
                 self.authority_map.remove(&chunk);
@@ -806,7 +748,7 @@ impl WorldManager {
                 }
             }
             WorldNetMessage::UnloadChunk { chunk } => {
-                self.chunk_state.insert(chunk, ChunkState::UnloadPending {});
+                self.chunk_state.insert(chunk, ChunkState::UnloadPending);
             }
 
             WorldNetMessage::AuthorityAlreadyTaken { chunk, authority } => {
@@ -827,7 +769,6 @@ impl WorldManager {
                         Destination::Peer(source),
                         WorldNetMessage::UnloadChunk { chunk },
                     );
-                    //warn!("Can't listen for {chunk:?} - not an authority");
                     return;
                 };
                 listeners.insert(source);
@@ -846,7 +787,6 @@ impl WorldManager {
                 let Some(ChunkState::Authority { listeners, .. }) =
                     self.chunk_state.get_mut(&chunk)
                 else {
-                    //warn!("Can't stop listen for {chunk:?} - not an authority");
                     return;
                 };
                 listeners.remove(&source);
@@ -962,7 +902,6 @@ impl WorldManager {
                 current_authority,
             } => {
                 if self.chunk_state.get(&chunk) != Some(&ChunkState::UnloadPending) {
-                    debug!("Will request authority transfer");
                     self.chunk_state.insert(chunk, ChunkState::Transfer);
                     self.emit_msg(
                         Destination::Peer(current_authority),
@@ -980,7 +919,6 @@ impl WorldManager {
                 }
             }
             WorldNetMessage::RequestAuthorityTransfer { chunk } => {
-                debug!("Got a request for authority transfer");
                 let state = self.chunk_state.get(&chunk);
                 if let Some(ChunkState::Authority { listeners, .. }) = state {
                     let chunk_data = self.outbound_model.get_chunk_data(chunk);
@@ -1015,7 +953,6 @@ impl WorldManager {
                 chunk_data,
                 listeners,
             } => {
-                debug!("Transfer ok");
                 if let Some(chunk_data) = chunk_data {
                     self.inbound_model.apply_chunk_data(chunk, &chunk_data);
                     self.outbound_model.apply_chunk_data(chunk, &chunk_data);
@@ -1037,7 +974,6 @@ impl WorldManager {
                 );
             }
             WorldNetMessage::TransferFailed { chunk } => {
-                debug!("Transfer failed, requesting authority normally");
                 let priority = self
                     .last_request_priority
                     .get(&chunk)
@@ -1060,12 +996,10 @@ impl WorldManager {
                 );
             }
             WorldNetMessage::NotifyNewAuthority { chunk } => {
-                debug!("Notified of new authority");
-                let state = self.chunk_state.get_mut(&chunk);
-                if let Some(ChunkState::Listening { authority, .. }) = state {
+                if let Some(ChunkState::Listening { authority, .. }) =
+                    self.chunk_state.get_mut(&chunk)
+                {
                     *authority = source;
-                } else {
-                    debug!("Got notified of new authority, but not a listener");
                 }
             }
         }
@@ -1073,7 +1007,7 @@ impl WorldManager {
 
     /// Should be called when player disconnects.
     /// This frees up any authority that player had.
-    pub(crate) fn handle_peer_left(&mut self, source: OmniPeerId) {
+    pub fn handle_peer_left(&mut self, source: PeerId) {
         let mut to_remove = Vec::new();
         for (c, chunk) in self.chunk_state.iter_mut() {
             match chunk {
@@ -1124,7 +1058,7 @@ impl WorldManager {
         }
     }
 
-    pub(crate) fn cut_through_world(&mut self, x: i32, y_min: i32, y_max: i32, radius: i32) {
+    pub fn cut_through_world(&mut self, x: i32, y_min: i32, y_max: i32, radius: i32) {
         let max_wiggle = 5;
         let interval = 300.0;
 
@@ -1141,12 +1075,11 @@ impl WorldManager {
         };
         let chunk_storage: Vec<(ChunkCoord, ChunkData)> = self
             .chunk_storage
-            .clone()
-            .into_par_iter()
+            .par_iter()
             .filter(|(coord, _)| {
                 min_cx <= coord.0 && max_cx >= coord.0 && coord.1 <= max_cy && coord.1 >= min_cy
             })
-            .map(|(chunk_coord, chunk_encoded)| {
+            .map(|(&chunk_coord, chunk_encoded)| {
                 let chunk_start_x = chunk_coord.0 * CHUNK_SIZE as i32;
                 let chunk_end_x = chunk_start_x + CHUNK_SIZE as i32;
                 let chunk_start_y = chunk_coord.1 * CHUNK_SIZE as i32;
@@ -1173,15 +1106,7 @@ impl WorldManager {
             self.chunk_storage.insert(entry.0, entry.1);
         }
     }
-    pub(crate) fn cut_through_world_line(
-        &mut self,
-        x: i32,
-        y: i32,
-        lx: i32,
-        ly: i32,
-        r: i32,
-        chance: u8,
-    ) {
+    pub fn cut_through_world_line(&mut self, x: i32, y: i32, lx: i32, ly: i32, r: i32, chance: u8) {
         if chance == 0 {
             return;
         }
@@ -1327,7 +1252,7 @@ impl WorldManager {
                                 || self
                                     .materials
                                     .get(&chunk.pixel(px).material)
-                                    .map(|(_, _, cell, _)| cell.can_remove(true, false))
+                                    .map(|m| m.cell_type.can_remove(true, false))
                                     .unwrap_or(true))
                                 && (chance == 100
                                     || rng.random_bool((chance as f64 / 100.0).clamp(0.0, 1.0)))
@@ -1352,7 +1277,7 @@ impl WorldManager {
             }
         }
     }
-    pub(crate) fn cut_through_world_circle(
+    pub fn cut_through_world_circle(
         &mut self,
         x: i32,
         y: i32,
@@ -1432,7 +1357,7 @@ impl WorldManager {
                                 || self
                                     .materials
                                     .get(&chunk.pixel(px).material)
-                                    .map(|(_, _, cell, _)| cell.can_remove(true, false))
+                                    .map(|m| m.cell_type.can_remove(true, false))
                                     .unwrap_or(true))
                                 && (chance == 100
                                     || rng.random_bool((chance as f64 / 100.0).clamp(0.0, 1.0)))
@@ -1457,8 +1382,7 @@ impl WorldManager {
             }
         }
     }
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::too_many_arguments)]
     fn do_ray(
         &self,
         mut x: i32,
@@ -1535,8 +1459,8 @@ impl WorldManager {
                 let px = icy as usize * CHUNK_SIZE + icx as usize;
                 let pixel = working_chunk.pixel(px);
                 if let Some(stats) = self.materials.get(&pixel.material) {
-                    let h = (stats.1 as f64 * mult as f64) as u64;
-                    if stats.0 > d || ray < h {
+                    let h = (stats.hardness as f64 * mult as f64) as u64;
+                    if stats.durability > d || ray < h {
                         return (last_coord, 0, None);
                     }
                     ray = ray.saturating_sub(h);
@@ -1561,7 +1485,6 @@ impl WorldManager {
         (Some((x, y)), 0, None)
     }
 
-    #[allow(clippy::type_complexity)]
     fn interior_iter(&self, ex: ExplosionData) -> (Vec<ExRet>, Vec<u64>) {
         let ExplosionData {
             x,
@@ -1612,8 +1535,8 @@ impl WorldManager {
         )
     }
 
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn cut_through_world_explosion(&mut self, exp: Vec<ExplosionData>) {
+    #[expect(clippy::type_complexity)]
+    pub fn cut_through_world_explosion(&mut self, exp: Vec<ExplosionData>) {
         let resres: Vec<((Vec<ExRet>, Vec<u64>), ExplosionData)> = exp
             .into_par_iter()
             .map(|ex| (self.interior_iter(ex), ex))
@@ -1667,8 +1590,8 @@ impl WorldManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cut_through_world_explosion_list(
+    #[expect(clippy::too_many_arguments)]
+    pub fn cut_through_world_explosion_list(
         &self,
         x: i32,
         y: i32,
@@ -1842,7 +1765,7 @@ impl WorldManager {
                             if self
                                 .materials
                                 .get(&chunk.pixel(px).material)
-                                .map(|(dur, _, cell, _)| *dur <= d && cell.can_remove(hole, liquid))
+                                .map(|m| m.durability <= d && m.cell_type.can_remove(hole, liquid))
                                 .unwrap_or(true)
                             {
                                 if prob != 0
@@ -1877,7 +1800,6 @@ impl WorldManager {
             .collect()
     }
 
-    #[allow(clippy::type_complexity)]
     fn interior_iter_chunk(
         &self,
         ex: ExplosionData,
@@ -1885,17 +1807,7 @@ impl WorldManager {
         chunk: ChunkCoord,
         a: f32,
     ) -> Option<(Option<u64>, ExTarget, u64)> {
-        let ExplosionData {
-            x,
-            y,
-            mut r,
-            d,
-            ray: _,
-            hole: _,
-            liquid: _,
-            mat: _,
-            prob: _,
-        } = ex;
+        let ExplosionData { x, y, mut r, d, .. } = ex;
         let rays = get_ray(r);
         if let ExTarget::Radius(p) = data.2 {
             r = p
@@ -1933,8 +1845,8 @@ impl WorldManager {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn cut_through_world_explosion_chunk(&mut self, chunk: ChunkCoord) {
+    #[expect(clippy::type_complexity)]
+    pub fn cut_through_world_explosion_chunk(&mut self, chunk: ChunkCoord) {
         let exp: Vec<(usize, (usize, usize, ExTarget, u64))> = self
             .explosion_pointer
             .remove(&chunk)
@@ -1973,9 +1885,8 @@ impl WorldManager {
             }
         }
     }
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn explosion_chunk(
+    #[expect(clippy::type_complexity)]
+    pub fn explosion_chunk(
         &self,
         data: &[(usize, Option<(Option<u64>, ExTarget, u64)>)],
         coord: ChunkCoord,
@@ -2016,17 +1927,7 @@ impl WorldManager {
             .iter()
             .map(|(i, data)| {
                 let ex = self.explosion_heap[*i];
-                let ExplosionData {
-                    x,
-                    y,
-                    r,
-                    d: _,
-                    ray: _,
-                    hole: _,
-                    liquid: _,
-                    mat: _,
-                    prob: _,
-                } = ex;
+                let ExplosionData { x, y, r, .. } = ex;
                 let rays = get_ray(r);
                 (
                     *i,
@@ -2047,11 +1948,11 @@ impl WorldManager {
                         y,
                         r,
                         d,
-                        ray: _,
                         hole,
                         liquid,
                         mat,
                         prob,
+                        ..
                     } = ex;
                     let dx = cx.abs_diff(x) as u64;
                     let dy = cy.abs_diff(y) as u64;
@@ -2063,7 +1964,7 @@ impl WorldManager {
                     }) && self
                         .materials
                         .get(&chunk.pixel(px).material)
-                        .map(|(dur, _, cell, _)| *dur <= d && cell.can_remove(hole, liquid))
+                        .map(|m| m.durability <= d && m.cell_type.can_remove(hole, liquid))
                         .unwrap_or(true)
                     {
                         if prob != 0
@@ -2087,8 +1988,7 @@ impl WorldManager {
             Some((chunk_delta.to_chunk_data(), all))
         }
     }
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::too_many_arguments)]
     fn do_ray_chunk(
         &self,
         stx: i32,
@@ -2157,10 +2057,10 @@ impl WorldManager {
                     let px = icy as usize * CHUNK_SIZE + icx as usize;
                     let pixel = working_chunk.pixel(px);
                     if let Some(stats) = self.materials.get(&pixel.material) {
-                        let h = (stats.1 as f64 * mult as f64) as u64;
+                        let h = (stats.hardness as f64 * mult as f64) as u64;
                         avg += h;
                         count2 += 1;
-                        if stats.0 > d || ray < h + ((count * avg) / count2) {
+                        if stats.durability > d || ray < h + ((count * avg) / count2) {
                             let nr = (dx as f64).hypot(dy as f64) as u64;
                             return if count2 == 1 {
                                 Some((0, 0, ExTarget::RayRad((ray, nr)), 0))
@@ -2231,7 +2131,7 @@ impl WorldManager {
         }
     }
 }
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn should_process_chunk(
     chunk_x: i32,
     chunk_y: i32,
@@ -2255,18 +2155,10 @@ fn should_process_chunk(
         }
     }
 }
-impl Drop for WorldManager {
-    fn drop(&mut self) {
-        if self.is_host {
-            self.save_state.save(&self.chunk_storage);
-            info!("Saved chunk data");
-        }
-    }
-}
 impl SaveStateEntry for FxHashMap<ChunkCoord, ChunkData> {
     const FILENAME: &'static str = "world_chunks";
 }
-pub(crate) struct ExRet {
+pub struct ExRet {
     loaded: Option<(ChunkCoord, ChunkData, bool, bool)>,
     unloaded: Option<(ChunkCoord, Vec<usize>)>,
 }
@@ -2351,4 +2243,93 @@ fn compute_atans(
 fn get_ray(r: u64) -> u64 {
     let c = r.saturating_mul(15708) / 10000; // tau/4
     (c - c % 8).clamp(1 << 4, 1 << 11)
+}
+
+pub struct Material {
+    pub durability: u32,
+    pub hardness: u32,
+    pub cell_type: CellType,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExplosionData {
+    x: i32,
+    y: i32,
+    r: u64,
+    d: u32,
+    ray: u64,
+    hole: bool,
+    liquid: bool,
+    mat: Pixel,
+    prob: u8,
+}
+
+impl ExplosionData {
+    #[expect(clippy::too_many_arguments)]
+    pub fn new(
+        x: i32,
+        y: i32,
+        r: u64,
+        d: u32,
+        ray: u64,
+        hole: bool,
+        liquid: bool,
+        mat: u16,
+        prob: u8,
+    ) -> ExplosionData {
+        ExplosionData {
+            x,
+            y,
+            r,
+            d,
+            ray,
+            hole,
+            liquid,
+            mat: Pixel {
+                flags: PixelFlags::Normal,
+                material: mat,
+            },
+            prob,
+        }
+    }
+}
+
+pub enum CellType {
+    Solid,
+    Liquid(LiquidType),
+    Gas,
+    Fire,
+    Invalid,
+}
+
+impl CellType {
+    pub fn new(s: &str, stat: bool, sand: bool) -> Self {
+        match s {
+            "solid" => Self::Solid,
+            "liquid" if stat => Self::Liquid(LiquidType::Static),
+            "liquid" if sand => Self::Liquid(LiquidType::Sand),
+            "liquid" => Self::Liquid(LiquidType::Liquid),
+            "gas" => Self::Gas,
+            "fire" => Self::Fire,
+            _ => Self::Invalid,
+        }
+    }
+
+    fn can_remove(&self, hole: bool, liquid: bool) -> bool {
+        match self {
+            Self::Liquid(LiquidType::Sand) | Self::Liquid(LiquidType::Static) | Self::Solid
+                if hole =>
+            {
+                true
+            }
+            Self::Liquid(LiquidType::Liquid) if liquid => true,
+            _ => false,
+        }
+    }
+}
+
+pub enum LiquidType {
+    Static,
+    Liquid,
+    Sand,
 }
